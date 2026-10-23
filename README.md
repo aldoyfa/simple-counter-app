@@ -9,9 +9,18 @@ The app tracks four categories:
 - Female Cash
 - Female QRIS
 
-Each tap creates an individual timestamped record saved on the device. Pending
-records can be uploaded later to Google Sheets through a preconfigured Google
-Apps Script web app URL.
+Each tap creates an individual timestamped record saved on the device. A photo
+can be linked to each record, either by taking one with the camera or choosing
+one from the gallery: use **Add photo** on the message shown after a tap, or the
+thumbnail next to the record in history. Everything works offline; internet is
+only needed when uploading.
+
+Uploading sends each pending record, with its photo, to a Google Apps Script
+web app. The script appends a row to the `Entries` sheet and saves the photo to
+the "QRIS Day 1" (31 October) or "QRIS Day 2" (1 November) Drive folder, with a
+link in the row's Attachment column. Records are uploaded one at a time, so if
+the connection drops, the ones already sent stay uploaded and the rest can be
+retried.
 
 ## Google Sheets upload setup
 
@@ -27,6 +36,7 @@ Apps Script web app URL.
 `lib/app_config.dart` reads the URL from `GOOGLE_APPS_SCRIPT_WEB_APP_URL`, so
 the private Apps Script URL does not need to be committed to Git.
 
-Successful uploads are marked locally and will not be uploaded again. Voided
+Successful uploads are marked locally and will not be uploaded again; the
+script also ignores an entry ID that is already in the sheet. Voided
 records remain visible in history but are excluded from totals and upload
 payloads.

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -6,6 +7,7 @@ import 'package:http/testing.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:simple_counter_app/counter_record.dart';
 import 'package:simple_counter_app/main.dart';
+import 'package:simple_counter_app/photo_service.dart';
 import 'package:simple_counter_app/record_store.dart';
 import 'package:simple_counter_app/upload_service.dart';
 
@@ -115,9 +117,98 @@ void main() {
     await tester.tap(find.text('Upload'));
     await tester.pumpAndSettle();
 
-    expect(uploader.uploadedRecordCount, 1);
+    expect(uploader.uploadedRecords, hasLength(1));
     expect(find.text('Pending: 0'), findsOneWidget);
     expect(find.text('Uploaded: 1'), findsOneWidget);
+  });
+
+  testWidgets('a failed upload keeps the remaining records pending', (
+    tester,
+  ) async {
+    final uploader = _FakeUploader(failOnCall: 2);
+    final store = _MemoryStore();
+    await tester.pumpWidget(_testApp(store: store, uploader: uploader));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Male Cash'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Male QRIS'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Female QRIS'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Upload'));
+    await tester.pumpAndSettle();
+
+    expect(uploader.uploadedRecords, hasLength(1));
+    expect(find.text('Uploaded: 1'), findsOneWidget);
+    expect(find.text('Pending: 2'), findsOneWidget);
+    expect(find.textContaining('1 of 3 records uploaded.'), findsOneWidget);
+    expect(
+      store.records.where((record) => record.status == RecordStatus.uploaded),
+      hasLength(1),
+    );
+  });
+
+  testWidgets('a photo can be linked right after tapping a counter', (
+    tester,
+  ) async {
+    final store = _MemoryStore();
+    final photos = _FakePhotoService();
+    final uploader = _FakeUploader();
+    await tester.pumpWidget(
+      _testApp(store: store, uploader: uploader, photoService: photos),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Female QRIS'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Add photo'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Take photo'));
+    await tester.pumpAndSettle();
+
+    expect(photos.requestedSources, [PhotoSource.camera]);
+    expect(store.records.single.photoPath, '/photos/photo-1.jpg');
+
+    await tester.tap(find.text('Upload'));
+    await tester.pumpAndSettle();
+
+    expect(uploader.uploadedRecords.single.photoPath, '/photos/photo-1.jpg');
+  });
+
+  testWidgets('photos can be replaced and removed from history', (
+    tester,
+  ) async {
+    final store = _MemoryStore();
+    final photos = _FakePhotoService();
+    await tester.pumpWidget(_testApp(store: store, photoService: photos));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Male QRIS'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.history));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Add photo'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Choose from gallery'));
+    await tester.pumpAndSettle();
+    expect(store.records.single.photoPath, '/photos/photo-1.jpg');
+
+    await tester.tap(find.byTooltip('Photo options'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Choose from gallery'));
+    await tester.pumpAndSettle();
+    expect(store.records.single.photoPath, '/photos/photo-2.jpg');
+    expect(photos.deletedPaths, ['/photos/photo-1.jpg']);
+
+    await tester.tap(find.byTooltip('Photo options'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remove photo'));
+    await tester.pumpAndSettle();
+    expect(store.records.single.photoPath, isNull);
+    expect(photos.deletedPaths, ['/photos/photo-1.jpg', '/photos/photo-2.jpg']);
+    expect(find.byTooltip('Add photo'), findsOneWidget);
   });
 
   testWidgets('staff username can be changed in the app', (tester) async {
@@ -146,6 +237,7 @@ void main() {
       status: RecordStatus.uploaded,
       uploadedAt: uploadedAt,
       uploadBatchId: 'batch-1',
+      photoPath: '/photos/1.jpg',
     );
 
     final restored = CounterRecord.fromJson(record.toJson());
@@ -155,6 +247,8 @@ void main() {
     expect(restored.status, RecordStatus.uploaded);
     expect(restored.uploadedAt, uploadedAt);
     expect(restored.uploadBatchId, 'batch-1');
+    expect(restored.photoPath, '/photos/1.jpg');
+    expect(restored.copyWith(clearPhoto: true).photoPath, isNull);
   });
 
   test('pending upload records excludes uploaded and voided rows', () {
@@ -209,21 +303,91 @@ void main() {
         }),
       );
 
-      await uploader.upload([
+      await uploader.uploadRecord(
         CounterRecord(
           id: 'pending',
           category: CounterCategory.maleCash,
           createdAt: DateTime.utc(2026, 5, 5),
           status: RecordStatus.pending,
         ),
-      ], staffUsername: 'Ayu');
+        staffUsername: 'Ayu',
+        uploadBatchId: 'upload-1',
+        uploadedAt: DateTime.utc(2026, 5, 5, 1),
+      );
 
       expect(requestedUris, hasLength(2));
       expect(requestedUris.last.host, 'script.googleusercontent.com');
       expect(payload?['staffUsername'], 'Ayu');
-      expect(payload?['records'], isNotEmpty);
+      expect(payload?['record']['id'], 'pending');
+      expect(payload?['photo'], isNull);
     },
   );
+
+  test('Apps Script uploader sends the photo with the record', () async {
+    Map<String, dynamic>? payload;
+    final uploader = AppsScriptRecordUploader(
+      webAppUrl: 'https://script.google.com/macros/s/test/exec',
+      readPhotoBytes: (path) async => [1, 2, 3],
+      client: MockClient((request) async {
+        payload = jsonDecode(request.body) as Map<String, dynamic>;
+        return http.Response('{"success":true}', 200);
+      }),
+    );
+
+    await uploader.uploadRecord(
+      CounterRecord(
+        id: '123-female_qris',
+        category: CounterCategory.femaleQris,
+        createdAt: DateTime.utc(2026, 10, 31, 3, 15),
+        status: RecordStatus.pending,
+        photoPath: '/photos/123-female_qris-9.jpg',
+      ),
+      staffUsername: 'Ayu',
+      uploadBatchId: 'upload-1',
+      uploadedAt: DateTime.utc(2026, 10, 31, 4),
+    );
+
+    expect(payload?['uploadId'], 'upload-1');
+    expect(payload?['record'], {
+      'id': '123-female_qris',
+      'category': 'female_qris',
+      'categoryLabel': 'Female QRIS',
+      'gender': 'Female',
+      'payment': 'QRIS',
+      'createdAt': '2026-10-31T03:15:00.000Z',
+    });
+    expect(payload?['photo'], {
+      'fileName': '123-female_qris.jpg',
+      'mimeType': 'image/jpeg',
+      'data': base64Encode([1, 2, 3]),
+    });
+  });
+
+  test('Apps Script uploader reports a missing photo file', () async {
+    final uploader = AppsScriptRecordUploader(
+      webAppUrl: 'https://script.google.com/macros/s/test/exec',
+      readPhotoBytes: (path) async => throw const FileSystemException('gone'),
+      client: MockClient((request) async {
+        fail('No request should be sent without the photo.');
+      }),
+    );
+
+    expect(
+      uploader.uploadRecord(
+        CounterRecord(
+          id: '1',
+          category: CounterCategory.maleQris,
+          createdAt: DateTime.utc(2026, 10, 31),
+          status: RecordStatus.pending,
+          photoPath: '/photos/missing.jpg',
+        ),
+        staffUsername: 'Ayu',
+        uploadBatchId: 'upload-1',
+        uploadedAt: DateTime.utc(2026, 10, 31),
+      ),
+      throwsA(isA<UploadException>()),
+    );
+  });
 }
 
 Finder _counterTileText(String category, String count) {
@@ -238,10 +402,15 @@ Finder _counterTileText(String category, String count) {
   );
 }
 
-Widget _testApp({CounterRecordStore? store, RecordUploader? uploader}) {
+Widget _testApp({
+  CounterRecordStore? store,
+  RecordUploader? uploader,
+  PhotoService? photoService,
+}) {
   return MyApp(
     store: store ?? _MemoryStore(),
     uploader: uploader ?? _FakeUploader(),
+    photoService: photoService ?? _FakePhotoService(),
   );
 }
 
@@ -269,17 +438,42 @@ class _MemoryStore implements CounterRecordStore {
 }
 
 class _FakeUploader implements RecordUploader {
-  int uploadedRecordCount = 0;
+  _FakeUploader({this.failOnCall});
+
+  final int? failOnCall;
+  final uploadedRecords = <CounterRecord>[];
+  var _calls = 0;
 
   @override
-  Future<UploadResult> upload(
-    List<CounterRecord> records, {
+  Future<void> uploadRecord(
+    CounterRecord record, {
     required String staffUsername,
+    required String uploadBatchId,
+    required DateTime uploadedAt,
   }) async {
-    uploadedRecordCount += records.length;
-    return UploadResult(
-      uploadBatchId: 'test-upload',
-      uploadedAt: DateTime.utc(2026, 5, 5),
-    );
+    _calls += 1;
+    if (_calls == failOnCall) {
+      throw const UploadException('No connection.');
+    }
+    uploadedRecords.add(record);
+  }
+}
+
+class _FakePhotoService implements PhotoService {
+  final requestedSources = <PhotoSource>[];
+  final deletedPaths = <String>[];
+
+  @override
+  Future<String?> capturePhoto(
+    PhotoSource source, {
+    required String recordId,
+  }) async {
+    requestedSources.add(source);
+    return '/photos/photo-${requestedSources.length}.jpg';
+  }
+
+  @override
+  Future<void> deletePhoto(String path) async {
+    deletedPaths.add(path);
   }
 }

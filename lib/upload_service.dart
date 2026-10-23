@@ -1,21 +1,23 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
 import 'app_config.dart';
 import 'counter_record.dart';
 
-class UploadResult {
-  const UploadResult({required this.uploadBatchId, required this.uploadedAt});
-
-  final String uploadBatchId;
-  final DateTime uploadedAt;
-}
+typedef PhotoBytesReader = Future<List<int>> Function(String path);
 
 abstract class RecordUploader {
-  Future<UploadResult> upload(
-    List<CounterRecord> records, {
+  /// Uploads a single record, including its photo when it has one.
+  ///
+  /// Uploading the same record twice must not create a duplicate row, so a
+  /// retry after a lost response is safe.
+  Future<void> uploadRecord(
+    CounterRecord record, {
     required String staffUsername,
+    required String uploadBatchId,
+    required DateTime uploadedAt,
   });
 }
 
@@ -23,39 +25,53 @@ class AppsScriptRecordUploader implements RecordUploader {
   AppsScriptRecordUploader({
     http.Client? client,
     String webAppUrl = googleAppsScriptWebAppUrl,
+    PhotoBytesReader? readPhotoBytes,
   }) : _client = client ?? http.Client(),
-       _webAppUrl = webAppUrl;
+       _webAppUrl = webAppUrl,
+       _readPhotoBytes = readPhotoBytes ?? _readFileBytes;
+
+  static const _requestTimeout = Duration(seconds: 90);
 
   final http.Client _client;
   final String _webAppUrl;
+  final PhotoBytesReader _readPhotoBytes;
 
   @override
-  Future<UploadResult> upload(
-    List<CounterRecord> records, {
+  Future<void> uploadRecord(
+    CounterRecord record, {
     required String staffUsername,
+    required String uploadBatchId,
+    required DateTime uploadedAt,
   }) async {
     if (_webAppUrl.isEmpty) {
       throw const UploadException(
-        'Set googleAppsScriptWebAppUrl in lib/app_config.dart before uploading.',
+        'The upload URL is missing. Build the app with '
+        '--dart-define-from-file=.env.',
       );
     }
     if (staffUsername.trim().isEmpty) {
       throw const UploadException('Enter the staff username before uploading.');
     }
-    if (records.isEmpty) {
-      throw const UploadException('There are no pending records to upload.');
-    }
 
-    final uploadedAt = DateTime.now();
-    final uploadBatchId = _buildUploadBatchId(uploadedAt);
     final body = jsonEncode({
-      'sheetName': _buildSheetName(uploadedAt),
       'uploadId': uploadBatchId,
-      'uploadedAt': uploadedAt.toIso8601String(),
+      'uploadedAt': uploadedAt.toUtc().toIso8601String(),
       'staffUsername': staffUsername.trim(),
-      'records': records.map((record) => record.toUploadJson()).toList(),
+      'record': record.toUploadJson(),
+      'photo': await _photoPayload(record),
     });
-    final response = await _postFollowingRedirects(Uri.parse(_webAppUrl), body);
+
+    final http.Response response;
+    try {
+      response = await _postFollowingRedirects(
+        Uri.parse(_webAppUrl),
+        body,
+      ).timeout(_requestTimeout);
+    } on UploadException {
+      rethrow;
+    } catch (error) {
+      throw UploadException('Upload failed, check the connection: $error');
+    }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw UploadException(
@@ -65,7 +81,14 @@ class AppsScriptRecordUploader implements RecordUploader {
 
     final responseBody = response.body.trim();
     if (responseBody.isNotEmpty) {
-      final decoded = jsonDecode(responseBody);
+      final Object? decoded;
+      try {
+        decoded = jsonDecode(responseBody);
+      } on FormatException {
+        throw const UploadException(
+          'The spreadsheet returned an unexpected response.',
+        );
+      }
       if (decoded is Map<dynamic, dynamic> && decoded['success'] == false) {
         throw UploadException(
           (decoded['error'] as String?) ??
@@ -73,8 +96,31 @@ class AppsScriptRecordUploader implements RecordUploader {
         );
       }
     }
+  }
 
-    return UploadResult(uploadBatchId: uploadBatchId, uploadedAt: uploadedAt);
+  Future<Map<String, String>?> _photoPayload(CounterRecord record) async {
+    final photoPath = record.photoPath;
+    if (photoPath == null) {
+      return null;
+    }
+
+    final List<int> bytes;
+    try {
+      bytes = await _readPhotoBytes(photoPath);
+    } catch (_) {
+      throw UploadException(
+        'The photo for ${record.category.label} at '
+        '${record.createdAt.toLocal()} is missing. Replace or remove it in '
+        'history.',
+      );
+    }
+
+    final extension = _photoExtension(photoPath);
+    return {
+      'fileName': '${record.id}$extension',
+      'mimeType': _mimeTypes[extension] ?? 'image/jpeg',
+      'data': base64Encode(bytes),
+    };
   }
 
   Future<http.Response> _postFollowingRedirects(Uri uri, String body) async {
@@ -120,26 +166,28 @@ class UploadException implements Exception {
   String toString() => message;
 }
 
-String _buildUploadBatchId(DateTime dateTime) {
-  return 'upload-${_compactDateTime(dateTime)}';
+String buildUploadBatchId(DateTime dateTime) {
+  return 'upload-${dateTime.toIso8601String().replaceAll(RegExp(r'[^0-9]'), '')}';
 }
 
-String _buildSheetName(DateTime dateTime) {
-  return 'Event Upload ${_displayDateTime(dateTime)}';
+const _mimeTypes = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.heic': 'image/heic',
+  '.gif': 'image/gif',
+};
+
+String _photoExtension(String path) {
+  final dotIndex = path.lastIndexOf('.');
+  if (dotIndex == -1 || dotIndex < path.lastIndexOf('/')) {
+    return '.jpg';
+  }
+  return path.substring(dotIndex).toLowerCase();
 }
 
-String _compactDateTime(DateTime dateTime) {
-  return dateTime.toIso8601String().replaceAll(RegExp(r'[^0-9]'), '');
-}
-
-String _displayDateTime(DateTime dateTime) {
-  final local = dateTime.toLocal();
-  return '${_twoDigits(local.year ~/ 100)}${_twoDigits(local.year % 100)}-'
-      '${_twoDigits(local.month)}-${_twoDigits(local.day)} '
-      '${_twoDigits(local.hour)}-${_twoDigits(local.minute)}';
-}
-
-String _twoDigits(int value) => value.toString().padLeft(2, '0');
+Future<List<int>> _readFileBytes(String path) => File(path).readAsBytes();
 
 bool _isRedirect(int statusCode) {
   return statusCode == 301 ||

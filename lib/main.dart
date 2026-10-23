@@ -1,6 +1,9 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import 'counter_record.dart';
+import 'photo_service.dart';
 import 'record_store.dart';
 import 'upload_service.dart';
 
@@ -9,12 +12,18 @@ void main() {
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key, CounterRecordStore? store, RecordUploader? uploader})
-    : _store = store,
-      _uploader = uploader;
+  const MyApp({
+    super.key,
+    CounterRecordStore? store,
+    RecordUploader? uploader,
+    PhotoService? photoService,
+  }) : _store = store,
+       _uploader = uploader,
+       _photoService = photoService;
 
   final CounterRecordStore? _store;
   final RecordUploader? _uploader;
+  final PhotoService? _photoService;
 
   @override
   Widget build(BuildContext context) {
@@ -27,6 +36,7 @@ class MyApp extends StatelessWidget {
       home: EventCounterPage(
         store: _store ?? SharedPreferencesCounterRecordStore(),
         uploader: _uploader ?? AppsScriptRecordUploader(),
+        photoService: _photoService ?? DevicePhotoService(),
       ),
     );
   }
@@ -37,10 +47,12 @@ class EventCounterPage extends StatefulWidget {
     super.key,
     required this.store,
     required this.uploader,
+    required this.photoService,
   });
 
   final CounterRecordStore store;
   final RecordUploader uploader;
+  final PhotoService photoService;
 
   @override
   State<EventCounterPage> createState() => _EventCounterPageState();
@@ -51,6 +63,8 @@ class _EventCounterPageState extends State<EventCounterPage> {
   String _staffUsername = '';
   bool _isLoading = true;
   bool _isUploading = false;
+  int _uploadDone = 0;
+  int _uploadTotal = 0;
 
   @override
   void initState() {
@@ -80,6 +94,107 @@ class _EventCounterPageState extends State<EventCounterPage> {
       status: RecordStatus.pending,
     );
     await _replaceRecords([..._records, record]);
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('${category.label} added.'),
+          action: SnackBarAction(
+            label: 'Add photo',
+            onPressed: () => _promptPhotoForRecord(record.id),
+          ),
+        ),
+      );
+  }
+
+  Future<void> _promptPhotoForRecord(String recordId) async {
+    final record = _recordById(recordId);
+    if (record == null || !mounted) {
+      return;
+    }
+    final action = await showPhotoActionSheet(context, record: record);
+    if (action == null || !mounted) {
+      return;
+    }
+    switch (action) {
+      case PhotoAction.camera:
+        await _attachPhoto(record, PhotoSource.camera);
+      case PhotoAction.gallery:
+        await _attachPhoto(record, PhotoSource.gallery);
+      case PhotoAction.view:
+        await openPhotoViewer(context, record);
+      case PhotoAction.remove:
+        await _removePhoto(record);
+    }
+  }
+
+  CounterRecord? _recordById(String id) {
+    for (final record in _records) {
+      if (record.id == id) {
+        return record;
+      }
+    }
+    return null;
+  }
+
+  Future<CounterRecord?> _attachPhoto(
+    CounterRecord record,
+    PhotoSource source,
+  ) async {
+    final String? photoPath;
+    try {
+      photoPath = await widget.photoService.capturePhoto(
+        source,
+        recordId: record.id,
+      );
+    } catch (error) {
+      _showMessage('Could not get the photo: $error');
+      return null;
+    }
+    if (photoPath == null) {
+      return null;
+    }
+
+    // The record may have changed while the camera was open.
+    final current = _recordById(record.id);
+    if (current == null || current.status == RecordStatus.uploaded) {
+      await widget.photoService.deletePhoto(photoPath);
+      return null;
+    }
+
+    final previousPhoto = current.photoPath;
+    final updated = current.copyWith(photoPath: photoPath);
+    await _replaceRecord(updated);
+    if (previousPhoto != null) {
+      await widget.photoService.deletePhoto(previousPhoto);
+    }
+    _showMessage('Photo linked to ${updated.category.label}.');
+    return updated;
+  }
+
+  Future<CounterRecord?> _removePhoto(CounterRecord record) async {
+    final current = _recordById(record.id);
+    final photoPath = current?.photoPath;
+    if (current == null || photoPath == null) {
+      return null;
+    }
+
+    final updated = current.copyWith(clearPhoto: true);
+    await _replaceRecord(updated);
+    await widget.photoService.deletePhoto(photoPath);
+    _showMessage('Photo removed.');
+    return updated;
+  }
+
+  Future<void> _replaceRecord(CounterRecord updated) async {
+    await _replaceRecords(
+      _records.map((record) {
+        return record.id == updated.id ? updated : record;
+      }).toList(),
+    );
   }
 
   Future<void> _undoLastTap() async {
@@ -134,31 +249,48 @@ class _EventCounterPageState extends State<EventCounterPage> {
       return;
     }
 
+    final uploadedAt = DateTime.now();
+    final uploadBatchId = buildUploadBatchId(uploadedAt);
     setState(() {
       _isUploading = true;
+      _uploadDone = 0;
+      _uploadTotal = uploadableRecords.length;
     });
 
+    // Upload one entry at a time and save progress after each, so a dropped
+    // connection only affects the entry that was in flight.
+    var uploadedCount = 0;
     try {
-      final result = await widget.uploader.upload(
-        uploadableRecords,
-        staffUsername: _staffUsername,
-      );
-      final uploadedIds = uploadableRecords.map((record) => record.id).toSet();
-      await _replaceRecords(
-        _records.map((record) {
-          if (!uploadedIds.contains(record.id)) {
-            return record;
-          }
-          return record.copyWith(
+      for (final record in uploadableRecords) {
+        await widget.uploader.uploadRecord(
+          record,
+          staffUsername: _staffUsername,
+          uploadBatchId: uploadBatchId,
+          uploadedAt: uploadedAt,
+        );
+        final current = _recordById(record.id) ?? record;
+        await _replaceRecord(
+          current.copyWith(
             status: RecordStatus.uploaded,
-            uploadedAt: result.uploadedAt,
-            uploadBatchId: result.uploadBatchId,
-          );
-        }).toList(),
-      );
-      _showMessage('${uploadableRecords.length} records uploaded.');
+            uploadedAt: uploadedAt,
+            uploadBatchId: uploadBatchId,
+          ),
+        );
+        uploadedCount += 1;
+        if (mounted) {
+          setState(() {
+            _uploadDone = uploadedCount;
+          });
+        }
+      }
+      _showMessage('$uploadedCount records uploaded.');
     } catch (error) {
-      _showMessage(error.toString());
+      _showMessage(
+        uploadedCount == 0
+            ? error.toString()
+            : '$uploadedCount of ${uploadableRecords.length} records uploaded. '
+                  '$error',
+      );
     } finally {
       if (mounted) {
         setState(() {
@@ -234,6 +366,8 @@ class _EventCounterPageState extends State<EventCounterPage> {
           records: _records,
           onVoidRecord: _voidRecord,
           onRestoreRecord: _restoreRecord,
+          onAttachPhoto: _attachPhoto,
+          onRemovePhoto: _removePhoto,
         ),
       ),
     );
@@ -331,7 +465,11 @@ class _EventCounterPageState extends State<EventCounterPage> {
                                   ),
                                 )
                               : const Icon(Icons.cloud_upload),
-                          label: Text(_isUploading ? 'Uploading' : 'Upload'),
+                          label: Text(
+                            _isUploading
+                                ? 'Uploading $_uploadDone/$_uploadTotal'
+                                : 'Upload',
+                          ),
                         ),
                       ),
                     ],
@@ -477,11 +615,19 @@ class HistoryPage extends StatefulWidget {
     required this.records,
     required this.onVoidRecord,
     required this.onRestoreRecord,
+    required this.onAttachPhoto,
+    required this.onRemovePhoto,
   });
 
   final List<CounterRecord> records;
   final Future<void> Function(CounterRecord record) onVoidRecord;
   final Future<void> Function(CounterRecord record) onRestoreRecord;
+  final Future<CounterRecord?> Function(
+    CounterRecord record,
+    PhotoSource source,
+  )
+  onAttachPhoto;
+  final Future<CounterRecord?> Function(CounterRecord record) onRemovePhoto;
 
   @override
   State<HistoryPage> createState() => _HistoryPageState();
@@ -496,6 +642,60 @@ class _HistoryPageState extends State<HistoryPage> {
   void initState() {
     super.initState();
     _records = widget.records;
+  }
+
+  void _replaceLocalRecord(CounterRecord updated) {
+    setState(() {
+      _records = _records.map((existingRecord) {
+        return existingRecord.id == updated.id ? updated : existingRecord;
+      }).toList();
+    });
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _changeStatus(CounterRecord record, RecordStatus status) async {
+    if (status == RecordStatus.voided) {
+      await widget.onVoidRecord(record);
+    } else {
+      await widget.onRestoreRecord(record);
+    }
+    _replaceLocalRecord(record.copyWith(status: status));
+    _showMessage(
+      status == RecordStatus.voided
+          ? 'Record voided.'
+          : 'Record restored to pending.',
+    );
+  }
+
+  Future<void> _handlePhoto(CounterRecord record) async {
+    final action = await showPhotoActionSheet(context, record: record);
+    if (action == null || !mounted) {
+      return;
+    }
+
+    final CounterRecord? updated;
+    switch (action) {
+      case PhotoAction.camera:
+        updated = await widget.onAttachPhoto(record, PhotoSource.camera);
+      case PhotoAction.gallery:
+        updated = await widget.onAttachPhoto(record, PhotoSource.gallery);
+      case PhotoAction.remove:
+        updated = await widget.onRemovePhoto(record);
+      case PhotoAction.view:
+        await openPhotoViewer(context, record);
+        return;
+    }
+    if (updated != null) {
+      _replaceLocalRecord(updated);
+    }
   }
 
   @override
@@ -568,53 +768,19 @@ class _HistoryPageState extends State<HistoryPage> {
                       padding: const EdgeInsets.all(16),
                       itemBuilder: (context, index) {
                         final record = filteredRecords[index];
+                        final canEditPhoto =
+                            record.status == RecordStatus.pending;
                         return _HistoryRecordTile(
                           record: record,
+                          onPhoto: canEditPhoto || record.hasPhoto
+                              ? () => _handlePhoto(record)
+                              : null,
                           onVoid: record.status == RecordStatus.pending
-                              ? () async {
-                                  await widget.onVoidRecord(record);
-                                  setState(() {
-                                    _records = _records.map((existingRecord) {
-                                      if (existingRecord.id != record.id) {
-                                        return existingRecord;
-                                      }
-                                      return existingRecord.copyWith(
-                                        status: RecordStatus.voided,
-                                      );
-                                    }).toList();
-                                  });
-                                  if (context.mounted) {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text('Record voided.'),
-                                      ),
-                                    );
-                                  }
-                                }
+                              ? () => _changeStatus(record, RecordStatus.voided)
                               : null,
                           onRestore: record.status == RecordStatus.voided
-                              ? () async {
-                                  await widget.onRestoreRecord(record);
-                                  setState(() {
-                                    _records = _records.map((existingRecord) {
-                                      if (existingRecord.id != record.id) {
-                                        return existingRecord;
-                                      }
-                                      return existingRecord.copyWith(
-                                        status: RecordStatus.pending,
-                                      );
-                                    }).toList();
-                                  });
-                                  if (context.mounted) {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text(
-                                          'Record restored to pending.',
-                                        ),
-                                      ),
-                                    );
-                                  }
-                                }
+                              ? () =>
+                                    _changeStatus(record, RecordStatus.pending)
                               : null,
                         );
                       },
@@ -633,11 +799,13 @@ class _HistoryPageState extends State<HistoryPage> {
 class _HistoryRecordTile extends StatelessWidget {
   const _HistoryRecordTile({
     required this.record,
+    required this.onPhoto,
     required this.onVoid,
     required this.onRestore,
   });
 
   final CounterRecord record;
+  final Future<void> Function()? onPhoto;
   final Future<void> Function()? onVoid;
   final Future<void> Function()? onRestore;
 
@@ -646,6 +814,7 @@ class _HistoryRecordTile extends StatelessWidget {
     return Card(
       margin: EdgeInsets.zero,
       child: ListTile(
+        leading: _PhotoThumbnail(record: record, onTap: onPhoto),
         title: Text(record.category.label),
         subtitle: Text(_formatDateTime(record.createdAt)),
         trailing: Wrap(
@@ -662,6 +831,132 @@ class _HistoryRecordTile extends StatelessWidget {
       ),
     );
   }
+}
+
+class _PhotoThumbnail extends StatelessWidget {
+  const _PhotoThumbnail({required this.record, required this.onTap});
+
+  final CounterRecord record;
+  final Future<void> Function()? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final photoPath = record.photoPath;
+    final colorScheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: record.hasPhoto ? 'Photo options' : 'Add photo',
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: SizedBox.square(
+            dimension: 48,
+            child: photoPath == null
+                ? ColoredBox(
+                    color: colorScheme.surfaceContainerHighest,
+                    child: Icon(
+                      Icons.add_a_photo_outlined,
+                      color: onTap == null
+                          ? colorScheme.outline
+                          : colorScheme.primary,
+                    ),
+                  )
+                : Image.file(
+                    File(photoPath),
+                    fit: BoxFit.cover,
+                    cacheWidth: 144,
+                    errorBuilder: (context, error, stackTrace) =>
+                        const Icon(Icons.broken_image_outlined),
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+enum PhotoAction { camera, gallery, view, remove }
+
+Future<PhotoAction?> showPhotoActionSheet(
+  BuildContext context, {
+  required CounterRecord record,
+}) {
+  final canEdit = record.status == RecordStatus.pending;
+  return showModalBottomSheet<PhotoAction>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (context) {
+      return SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                title: Text(record.category.label),
+                subtitle: Text(_formatDateTime(record.createdAt)),
+              ),
+              if (canEdit) ...[
+                ListTile(
+                  leading: const Icon(Icons.photo_camera),
+                  title: Text(record.hasPhoto ? 'Retake photo' : 'Take photo'),
+                  onTap: () => Navigator.of(context).pop(PhotoAction.camera),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.photo_library),
+                  title: const Text('Choose from gallery'),
+                  onTap: () => Navigator.of(context).pop(PhotoAction.gallery),
+                ),
+              ],
+              if (record.hasPhoto)
+                ListTile(
+                  leading: const Icon(Icons.image),
+                  title: const Text('View photo'),
+                  onTap: () => Navigator.of(context).pop(PhotoAction.view),
+                ),
+              if (canEdit && record.hasPhoto)
+                ListTile(
+                  leading: const Icon(Icons.delete_outline),
+                  title: const Text('Remove photo'),
+                  onTap: () => Navigator.of(context).pop(PhotoAction.remove),
+                ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+Future<void> openPhotoViewer(BuildContext context, CounterRecord record) {
+  final photoPath = record.photoPath;
+  if (photoPath == null) {
+    return Future.value();
+  }
+  return Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      builder: (context) => Scaffold(
+        backgroundColor: Colors.black,
+        appBar: AppBar(
+          backgroundColor: Colors.black,
+          foregroundColor: Colors.white,
+          title: Text(record.category.label),
+        ),
+        body: Center(
+          child: InteractiveViewer(
+            child: Image.file(
+              File(photoPath),
+              errorBuilder: (context, error, stackTrace) => const Text(
+                'Photo file not found.',
+                style: TextStyle(color: Colors.white),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 String _formatDateTime(DateTime dateTime) {

@@ -1,13 +1,15 @@
 enum CounterCategory {
-  maleCash('male_cash', 'Male Cash'),
-  maleQris('male_qris', 'Male QRIS'),
-  femaleCash('female_cash', 'Female Cash'),
-  femaleQris('female_qris', 'Female QRIS');
+  maleCash('male_cash', 'Male Cash', 'Male', 'Cash'),
+  maleQris('male_qris', 'Male QRIS', 'Male', 'QRIS'),
+  femaleCash('female_cash', 'Female Cash', 'Female', 'Cash'),
+  femaleQris('female_qris', 'Female QRIS', 'Female', 'QRIS');
 
-  const CounterCategory(this.value, this.label);
+  const CounterCategory(this.value, this.label, this.gender, this.payment);
 
   final String value;
   final String label;
+  final String gender;
+  final String payment;
 
   static CounterCategory fromValue(String value) {
     return CounterCategory.values.firstWhere(
@@ -43,6 +45,7 @@ class CounterRecord {
     required this.status,
     this.uploadedAt,
     this.uploadBatchId,
+    this.photoPath,
   });
 
   final String id;
@@ -51,6 +54,9 @@ class CounterRecord {
   final RecordStatus status;
   final DateTime? uploadedAt;
   final String? uploadBatchId;
+  final String? photoPath;
+
+  bool get hasPhoto => photoPath != null;
 
   bool get isActive => status != RecordStatus.voided;
 
@@ -62,6 +68,8 @@ class CounterRecord {
     RecordStatus? status,
     DateTime? uploadedAt,
     String? uploadBatchId,
+    String? photoPath,
+    bool clearPhoto = false,
   }) {
     return CounterRecord(
       id: id,
@@ -70,6 +78,7 @@ class CounterRecord {
       status: status ?? this.status,
       uploadedAt: uploadedAt ?? this.uploadedAt,
       uploadBatchId: uploadBatchId ?? this.uploadBatchId,
+      photoPath: clearPhoto ? null : photoPath ?? this.photoPath,
     );
   }
 
@@ -81,6 +90,7 @@ class CounterRecord {
       'status': status.value,
       'uploadedAt': uploadedAt?.toIso8601String(),
       'uploadBatchId': uploadBatchId,
+      'photoPath': photoPath,
     };
   }
 
@@ -89,7 +99,9 @@ class CounterRecord {
       'id': id,
       'category': category.value,
       'categoryLabel': category.label,
-      'createdAt': createdAt.toIso8601String(),
+      'gender': category.gender,
+      'payment': category.payment,
+      'createdAt': createdAt.toUtc().toIso8601String(),
     };
   }
 
@@ -103,6 +115,7 @@ class CounterRecord {
           ? null
           : DateTime.parse(json['uploadedAt'] as String),
       uploadBatchId: json['uploadBatchId'] as String?,
+      photoPath: json['photoPath'] as String?,
     );
   }
 }
