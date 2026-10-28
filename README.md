@@ -12,7 +12,9 @@ The app tracks four categories:
 Each tap creates an individual timestamped record saved on the device. A photo
 can be linked to each record, either by taking one with the camera or choosing
 one from the gallery: use **Add photo** on the message shown after a tap, or the
-thumbnail next to the record in history. Everything works offline; internet is
+thumbnail next to the record in history. Photos are
+compressed on the phone when attached (about 1080px, roughly 150-250 KB) so
+uploads stay quick. Everything works offline; internet is
 only needed when uploading.
 
 Uploading sends each pending record, with its photo, to a Google Apps Script
